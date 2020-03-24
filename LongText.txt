@@ -1,0 +1,715 @@
+local function checkstatus(current_status)
+    if current_status == "monitor" then
+        return true
+    else
+        ngx.header.content_type = "text/html"
+        ngx.status = 430
+        ngx.say(html..customhtml())
+        ngx.exit(ngx.status)
+    end
+end
+
+local function redirectcaptcha(token, url)
+    local waf_sec_url = global:get("waf_sec_url") or SECURL
+    ngx.redirect(waf_sec_url.."?token="..token.."&url="..url)
+end
+
+function ToStringEx(value)
+    if type(value)=='table' then
+       return TableToStr(value)
+    elseif type(value)=='string' then
+        return "\'"..value.."\'"
+    else
+       return tostring(value)
+    end
+end
+
+function TableToStr(t)
+    if t == nil then return "" end
+    local retstr= "{"
+
+    local i = 1
+    for key,value in pairs(t) do
+        local signal = ","
+        if i==1 then
+          signal = ""
+        end
+
+        if key == i then
+            retstr = retstr..signal..ToStringEx(value)
+        else
+            if type(key)=='number' or type(key) == 'string' then
+                retstr = retstr..signal..'['..ToStringEx(key).."]="..ToStringEx(value)
+            else
+                if type(key)=='userdata' then
+                    retstr = retstr..signal.."*s"..TableToStr(getmetatable(key)).."*e".."="..ToStringEx(value)
+                else
+                    retstr = retstr..signal..key.."="..ToStringEx(value)
+                end
+            end
+        end
+
+        i = i+1
+    end
+
+     retstr = retstr.."}"
+     return retstr
+end
+
+function StrToTable(str)
+    if str == nil or type(str) ~= "string" then
+        return
+    end
+
+    return loadstring("return " .. str)()
+end
+
+local function checklist(data, engine_status)
+    local list_start=gettimeofday()
+    local int_val = iptoint(data['ip'])
+    for _,list in pairs(globalList['list']) do
+        if DBG then debug("开始匹配名单: "..list['name']) end
+        if list['status'] ~= "off" then
+            for _,v in pairs(list['check']) do
+                if v['var'] == "UA" then
+                    local ua_pattern = v['pattern']['ua']
+                    if ua_pattern and ua_pattern ~= "" then
+                        local from, to, err = ngx.re.find(data['useragent'], ua_pattern, "isjo")
+                        if from then
+                            if list['log'] == "on" then
+                                dolog(data, list['name'].."_ua",list['status'], "ua")
+                            end
+                            if string.sub(list['name'],1,5) == "white" or list['status'] == "monitor" then
+                                return true
+                            else
+                                checkstatus(engine_status)
+                            end
+                        end
+                    end
+                elseif v['var'] == "URI" then
+                    local uri_pattern = v['pattern']['uri']
+                    if uri_pattern and uri_pattern ~= "" then
+                        local from, to, err = ngx.re.find(data['uri'], uri_pattern, "isjo")
+                        if from then
+                            if list['log'] == "on" then
+                                dolog(data, list['name'].."_uri", list['status'], "uri")
+                            end
+                            if string.sub(list['name'], 1, 5) == "white" or list['status'] == "monitor" then
+                                return true
+                            else
+                                checkstatus(engine_status)
+                            end
+                        end
+                    end
+                elseif v['var'] == "IP_UA" then
+                    local n, t = binarysearch(v['pattern'], "value", int_val)
+                    if DBG then debug(n..":"..t.." times."..#v['pattern']..int_val) end
+                    if n ~= -1 then
+                        local ua_pattern = v['pattern'][n]['ua']
+                        local matchdata
+                        if ua_pattern and ua_pattern ~= "" then
+                            if DBG then debug(data['useragent']..",正则:\n"..ua_pattern) end
+                            local from, to, err = ngx.re.find(data['useragent'], ua_pattern, "isjo")
+                            if not from then
+                                return false
+                            end
+                        end
+                        if list['log'] == "on" then
+                            dolog(data, list['name'].."_ip_ua",list['status'], "ip and ua")
+                        end 
+                        if string.sub(list['name'],1,5) == "white" or list['status'] == "monitor" then
+                            return true
+                        else
+                            checkstatus(engine_status)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if DBG then debug("未命中黑白名单,耗时"..gettimeofday()-list_start) end
+end
+
+function StrToTable(str)
+    if str == nil or type(str) ~= "string" then
+        return
+    end
+    return loadstring("return " .. str)()
+end
+
+
+local function DeepJson (json_value,e)
+    local from, to, err
+    if type(e) == "table" then
+        for k,v in pairs(e) do
+            DeepJson(json_value,v)
+        end
+    else
+--        debug("参数为:"..e)
+        from, to, err = ngx.re.find(e, global_re, "jo")
+        if not from then
+            table.insert(json_value,e)
+        else
+            if DBG then debug("过滤参数"..tostring(e)) end
+        end
+
+    end
+end
+
+local function libcheck(val)
+    local result1,result2
+    local sqli_start=gettimeofday()
+    sql_state = libinjection.sqli_state()
+    libinjection.sqli_init(sql_state, tostring(val), tostring(val):len(), 0)
+    result1 = libinjection.is_sqli(sql_state)
+    if DBG then debug("libinjection.sqli检测"..val.." 结果:"..result1.." 耗时"..gettimeofday()-sqli_start) end
+    if result1 == 1 then
+        return true,"libinjection-sqli"
+    else
+        local xss_start=gettimeofday()
+        result2 = libinjection.xss(tostring(val),tostring(val):len())
+        if DBG then debug("libinjection.xss检测"..val.." 结果:"..result2.." 耗时"..gettimeofday()-xss_start) end
+        if result2 == 1 then
+            return true,"libinjection-xss"
+        else
+            return false,""
+        end
+    end
+end
+
+function in_table(value, tbl)
+    for k,v in pairs(tbl) do
+        if v == value then
+            return true
+        end
+    end
+    return false
+end
+
+local function libinjectioncheck(data)
+    local libin_match = false
+    local libin_desc = ""
+    if type(data) == "table" then
+        for key, val in pairs(data) do
+            if type(val) == "table" then
+                for key_t, val_t in pairs(val) do
+                    if type(val_t) == "string" then
+                        -- 校验
+                    end
+                end
+            elseif type(val) == "string" then
+                if pcall(function(v)
+                    local json_value = {}
+                    local deepJson_start=gettimeofday()
+                    DeepJson(json_value,json.decode(v))
+                    if DBG then debug("拆分args耗时"..gettimeofday()-deepJson_start) end
+                    -- json字符串
+                    for json_k, json_v in ipairs(json_value) do
+                            -- 使用libinjection
+                        if not in_table(json_v, arg_list) then
+                            table.insert(arg_list, json_v)
+                            libin_match,libin_desc = libcheck(json_v)
+                        end
+
+                        if libin_match then
+                            break
+                        end
+                    end
+                    end,val) then
+                    else
+                        -- 非json字符串
+                        if not in_table(val, arg_list) then
+                            table.insert(arg_list, val)
+                            libin_match,libin_desc = libcheck(val)
+                        end
+                    end
+                end
+        end
+        return libin_match,libin_desc
+    end
+end
+
+local function recheck(data, pattern)
+    local from, to, err
+    if type(data) == "string" then
+        local recheck_start=gettimeofday()
+        from, to, err = ngx.re.find(data, pattern, "isjo")
+        if DBG then debug("字符串000: "..data..", 正则: "..pattern.." 耗时："..gettimeofday()-recheck_start..", result:"..(from or "not match whitelist")) end
+        if from then return string.sub(data, from, to) end
+    elseif type(data) == "table" then
+        for key, val in pairs(data) do
+            if type(val) == "table" then
+                for key_t, val_t in pairs(val) do
+                    if type(val_t) == "string" then
+                        from, to, err = ngx.re.find(val_t, pattern, "isjo")
+                        if DBG then debug("字符串111: "..val_t..", 正则: "..pattern) end
+                        if from then return string.sub(val_t, from, to) end
+                    end
+                end
+            elseif type(val) == "string" then
+                if pcall(function(v)
+                    local json_value = {}
+                    DeepJson(json_value,json.decode(v))
+                    -- json字符串
+                    for json_k, json_v in ipairs(json_value) do
+                        local recheck_start2=gettimeofday()
+                        from, to, err = ngx.re.find(json_v, pattern, "isjo")
+                        if DBG then debug("字符串222: "..json_v..", 正则: "..pattern.." 耗时："..gettimeofday()-recheck_start2) end
+                        if from then break end
+                        end
+                    end,val) then
+                    else
+                        -- 非json字符串
+                        from, to, err = ngx.re.find(val, pattern, "isjo")
+                        if DBG then debug("字符串333: "..val..", 正则: "..pattern) end
+                    end
+                if from then return string.sub(val, from, to) end
+            end
+        end
+    end
+    return nil
+end
+
+local function checkdynamic(listdata, data, engine_status)
+    local dynamic = ngx.shared.dynrule
+    local value, flags = dynamic:get(listdata["ip"])
+    if value and data['host']..data['uri'] ~= SECURL then
+        local match = recheck(data['host'], value)
+        if match then
+            if DBG then debug("命中规则") end
+            dolog(listdata, "dynamic", "on", match)
+            if flags then
+                checkstatus(engine_status)
+            end
+            redirectcaptcha(tokenize(listdata['ip']), ngx.var.scheme.."://"..data['host']..data['uri'])
+        end
+    end
+end
+
+local function checkrule(listdata,data, engine_status, method, waf_post_status)
+    local libinjection_status = global:get("libinjection") or "off"
+    local globalRuleCopy = {}
+    local rule_start=gettimeofday()
+    if libinjection_status == "on" then
+        globalRuleCopy = libinjectionRule
+    else
+        globalRuleCopy = globalRule
+    end
+    local _desc = ""
+    if DBG then debug("开始匹配普通规则") end
+        for _,v in pairs(globalRuleCopy) do
+            for _,rule in pairs(v['rule']) do
+                if rule['status'] ~= "off" then
+                    if DBG then
+                        --debug("规则内容:")
+                        --print_r(rule['check'])
+                        debug("域名白名单: "..rule['requests'])
+                    end
+
+                    local field=rule['check']['var']
+                    local pattern=rule['check']['pattern']
+                    --for _, f in pairs({"uri","args","post","cookie"}) do
+                    for _, f in pairs({"uri","args","post", "headers"}) do
+                        if data[f] ~= "unknow" then
+                            local checkdata
+                            for _, check_field in pairs(field:split("|")) do
+                                if DBG then debug("check_field:"..check_field) end
+                                if check_field == f then
+                                    checkdata = data[f]
+                                else
+                                    local header_field = string.match(check_field, "header%-([%a%-]+)")
+                                    if header_field then
+                                        if DBG then debug("header_field:"..header_field) end
+                                        checkdata = data["headers"][header_field]
+                                    end
+                                end
+                            end
+                            --local from, to, err = string.find(field, f, 1, true)
+                            --if from then
+                            if checkdata then
+                                local match = false
+                                if DBG then debug("----"..f.."----") end
+                                --local match = recheck(data[f], pattern)
+                                if libinjection_status == "on" then
+                                        local libcheck_start=gettimeofday()
+                                        if f == "args" then
+                                            match,_desc = libinjectioncheck(checkdata)
+                                        else
+                                            match = false
+                                            _desc = ""
+                                        end
+--                                        if DBG and not match then debug("未命中libinjection,耗时"..gettimeofday()-libcheck_start) end
+                                    if not match then
+                                        match = recheck(checkdata, pattern)
+                                    end
+
+                                else
+                                        match = recheck(checkdata, pattern)
+                                end
+
+                                if match then
+                                    -- check request white list
+                                    if _desc ~= "" and _desc ~= nil then
+                                        rule['id'] = "0"
+                                        rule['name'] = _desc
+                                        rule['status'] = "on"
+                                    end
+
+                                    if rule['requests'] ~= "" then
+                                        if recheck(data['host']..data['uri'], rule['requests']) then goto nextrule end
+                                        if recheck(data['args'], rule['requests']) then goto nextrule end
+                                    end
+
+                                    if DBG then
+                                        debug("命中规则"..rule['id'])
+                                        debug("header is:")
+                                        debug(tostring(data['headers']['content-type']))
+                                    end
+                                    if rule['log'] == "on" then
+                                        dolog(listdata,rule['name'],rule['status'], match)
+                                    end
+                                    if rule['status'] == "monitor" then
+                                        goto nextrule
+                                    elseif method == "POST" and engine_status == "on" then
+                                        checkstatus(waf_post_status)
+                                    else
+                                        checkstatus(engine_status)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                ::nextrule::
+            end
+        end
+    if DBG then debug("未命中普通规则,耗时"..gettimeofday()-rule_start) end
+end
+
+local function get_args(args)
+    local args_list = {}
+    if type(args) == "table" then
+        for key, val in pairs(args) do
+            if type(val) == "table" then
+                for key_t, val_t in pairs(val) do
+                    if type(val_t) == "string" then
+                        table.insert(args_list, val_t)
+                    end
+                end
+            elseif type(val) == "string" then
+                if pcall(function(v)
+                    DeepJson(args_list, json.decode(v))
+                    -- json字符串
+                    end,val) then
+                    else
+                        -- 非json字符串
+                        table.insert(args_list, val)
+                    end
+            end
+        end
+    else
+        DeepJson(args_list, args)
+    end
+    return args_list
+end
+
+local function checkcc(listdata,data, waf_cc_status)
+    if DBG then debug("开始CC防御") end
+    CCcount=tonumber(string.match(CCRate,'(.*)/'))
+    CCseconds=tonumber(string.match(CCRate,'/(.*)'))
+    local token=data
+    local limit=ngx.shared.limit
+    local cclimit,_=limit:get(token)
+    if cclimit then
+        if cclimit > CCcount then
+            checkstatus(waf_cc_status)
+        else
+            if cclimit == CCcount then
+                dolog(listdata,"CC attack : "..token, waf_cc_status, tostring(cclimit))
+            end
+            limit:incr(token, 1)
+        end
+    else
+        limit:set(token, 1, CCseconds)
+    end
+    if DBG then debug("结束CC防御") end
+end
+
+local function checkscan(listdata, engine_status)
+    if DBG then debug("开始扫描防御") end
+    if ngx.var.http_Acunetix_Aspect then
+        dolog(listdata,"Acunetix",engine_status, "awvs")
+        checkstatus(engine_status)
+    elseif ngx.var.http_X_Scan_Memo then
+        dolog(listdata,"XScan",engine_status, "xscan")
+        checkstatus(engine_status)
+    end
+    if DBG then debug("结束扫描器防御") end
+end
+
+local function getargs()
+    local url=ngx.var.request_uri or " error uri"
+    local args=""
+    url = ngx.unescape_uri(url)
+    local from, to, err = string.find(url, "?", 1, true)
+    if from then
+        url, args = string.match(url,"/([^?]*)?(.*)")
+    else
+        url = string.match(url,"/(.*)")
+    end
+    return args
+end
+
+local function gettype(headers)
+    local header = headers["content-type"]
+    if not header then
+        return nil
+    end
+
+    if type(header) == "table" then
+        header = header[1]
+    end
+    return header
+end
+local function getxff(headers)
+    local header = headers["x-forwarded-for"]
+    if not header then
+        return nil
+    end
+    if type(header) == "table" then
+        header = header[1]
+    end
+    local from, to, err = ngx.re.find(header, [[^\d+\.\d+\.\d+\.\d+]], "isjo")
+    if from then
+        return string.sub(header, from, to)
+    else
+        return nil
+    end
+end
+
+local function explode ( _str,seperator )  
+    local pos, arr = 0, {}  
+        for st, sp in function() return string.find( _str, seperator, pos, true ) end do  
+            table.insert( arr, string.sub( _str, pos, st-1 ) )  
+            pos = sp + 1  
+        end  
+    table.insert( arr, string.sub( _str, pos ) )  
+    return arr  
+end  
+
+local function get_body_data(content_type, data)
+    local data_json = {}
+    local from, to, err
+
+    if content_type == nil then
+        table.insert(data_json, data)
+
+    elseif content_type == 'application/x-www-form-urlencoded' then
+        local post_args = ngx.req.get_post_args(ngx.var.reqargs_max_post_args or 100)
+        for _, v in pairs(post_args) do
+            from, to, err = ngx.re.find(v, global_re, "jo")
+            if not from then
+                table.insert(data_json, v)
+            end
+    end
+
+    elseif string.sub(content_type, 1, 16) == "application/json" or string.sub(content_type, 1, 10) == "text/plain" then
+        if pcall(function(v)
+            DeepJson(data_json,json.decode(v))
+            end,data) then
+            else
+                table.insert(data_json, data)
+        end
+    elseif string.sub(content_type, 1, 19) == "multipart/form-data"  then
+        local boundary = "--" .. string.sub(content_type, 31)
+        local body_data_table = explode(tostring(data), boundary)
+        local rm_first_str = table.remove(body_data_table, 1)
+        local rm_last_str = table.remove(body_data_table)
+        for i, v in ipairs(body_data_table) do
+            local temp_param_value
+            local start_pos, end_pos, capture, capture2 = string.find(v, 'Content%-Disposition: form%-data; name="(.+)"; filename="(.*)"')
+            if not start_pos then --普通参数
+                local t = explode(v, "\r\n\r\n")
+--                local temp_param_name = string.sub(t[1], 41, -2)
+                temp_param_value = string.sub(t[2], 1, -3)
+
+            else --文件类型的参数，capture是参数名称，capture2是文件名
+                temp_param_value = capture2
+            end
+            from, to, err = ngx.re.find(temp_param_value, global_re, "jo")
+            if not from then
+                table.insert(data_json, temp_param_value)
+            end
+        end
+
+    else
+        table.insert(data_json, data)
+    end
+    return data_json
+end
+
+local function get_headers(args)
+    local args_list = {}
+    args_list['headers'] = {}
+    if type(args) == "table" then
+        for key, val in pairs(args) do
+            args_list[key] = {}
+            if type(val) == "table" then
+                for key_t, val_t in pairs(val) do
+                    if type(val_t) == "string" then
+                        table.insert(args_list['headers'], val_t)
+                        table.insert(args_list[key], val_t)
+                    end
+                end
+            elseif type(val) == "string" then
+                if pcall(function(v)
+                    DeepJson(args_list, json.decode(v))
+                    -- json字符串
+                    end,val) then
+                    else
+                        -- 非json字符串
+                        table.insert(args_list['headers'], val)
+                        table.insert(args_list[key], val)
+                    end
+            end
+        end
+    else
+        DeepJson(args_list, args)
+    end
+    return args_list
+end
+
+function checkcore(waf_engine_status)
+    local ts_start = gettimeofday()
+--    if DBG then debug("=====开始核心检测=====") end
+--    local ts_start = gettimeofday()
+    local method = ngx.req.get_method()
+    --if DBG then debug(method) end
+    local waf_post_status = global:get("waf_post_status")
+    local waf_headers_status = global:get("waf_headers") or "off"
+    if method == "POST" then
+        if waf_post_status == "off" then
+            return true
+        end
+    --elseif method ~= "GET" and method ~= "HEAD" then
+    --    return true
+    end
+
+    local uri=yesorno(ngx.unescape_uri(ngx.var.uri))
+    local referer=yesorno(ngx.var.http_referer)
+    local useragent=yesorno(ngx.var.http_user_agent)
+    --local cookie=yesorno(ngx.var.http_cookie)
+    local host=yesorno(ngx.var.host)
+    local args=yesorno(ngx.req.get_uri_args())
+
+    local headers=ngx.req.get_headers()
+    local ip=yesorno(getxff(headers) or ngx.var.remote_addr)
+    local uri_list = get_args(uri)
+    local args_list = get_args(args)
+    local headers_list = {}
+    if waf_headers_status == "on" then
+       headers_list = headers
+    end
+    local post, body_data
+    local post_data = {}
+--    if method == "POST" and global:get("waf_post_status") == "on" and global:get("libinjection") == "on" then
+--        local body_length = tonumber(headers['content-length'])
+--        if body_length < POSTMAXLEN then
+--            local content_type = ngx.var.content_type
+--            ngx.req.read_body()
+--            local post_body_data = ngx.req.get_body_data()
+--            post_data = get_body_data(content_type, post_body_data)
+----            for _, v in ipairs(post_data) do
+----                debug("post data222222 " .. " value: " .. v)
+----            end
+--        end
+--    end
+
+
+
+
+    --[[if method == "POST" then
+        local body_length = tonumber(headers['content-length'])
+        if body_length < POSTMAXLEN then
+            --NOCALC = body_length > POSTNOCALC
+            ngx.req.read_body()
+            local body_content_type = gettype(headers)
+            if body_content_type and string.len(body_content_type) > 20 and string.sub(body_content_type, 1, 20) == "multipart/form-data;" then
+                local body_data = ngx.req.get_body_data()
+                local new_body_data = {}
+                local boundary = "--"..string.sub(body_content_type, 31)
+                if DBG then debug(type(body_data)) end
+                local body_data_table = explode(tostring(body_data), boundary)
+                local rm_first_str = table.remove(body_data_table, 1)
+                local rm_last_str = table.remove(body_data_table)
+                for i,v in ipairs(body_data_table) do  
+                    local start_pos,end_pos,capture,capture2 = string.find(v,'Content%-Disposition: form%-data; name="(.+)"; filename="(.*)"')
+                    if not start_pos then--普通参数  
+                        local t = explode(v,"\r\n\r\n")  
+                        local temp_param_name = string.sub(t[1],41,-2)  
+                        local temp_param_value = string.sub(t[2],1,-3)  
+                        if DBG then debug(t[1]..": "..t[2]) end
+                        new_body_data[temp_param_name] = temp_param_value
+                        -- args[temp_param_name] = temp_param_value  
+                    else--文件类型的参数，capture是参数名称，capture2是文件名  
+                        if DBG then debug(capture.."::: "..capture2) end
+                        new_body_data[capture] = capture2
+                        -- file_args[capture] = capture2  
+                        -- table.insert(new_body_data,v)  
+                   end  
+                end  
+                post=yesorno(new_body_data)
+            elseif string.find(body_content_type, "application/x-www-form-urlencoded", 1, true) then
+                post=yesorno(ngx.req.get_post_args())
+            else
+                post=yesorno(ngx.req.get_body_data())
+            end
+        end
+    end]]
+    arg_list = {}
+    listdata={ip = ip, referer = referer, useragent = useragent, uri = uri}
+    ruledata={host = host, uri = uri, args = args, post = post, headers=headers}
+    local waf_cc_status = global:get("waf_cc_status") or "off"
+
+    if checklist(listdata, waf_engine_status) then
+        return
+    else
+        if method == "POST" and global:get("waf_post_status") == "on" and global:get("libinjection") == "on" then
+        local body_length = tonumber(headers['content-length'])
+        if body_length < POSTMAXLEN then
+            local content_type = ngx.var.content_type
+            ngx.req.read_body()
+            local post_body_data = ngx.req.get_body_data()
+            local get_body_start = gettimeofday()
+            post_data = get_body_data(content_type, post_body_data)
+            global:set("post_body_time", (gettimeofday() - get_body_start))
+--            for _, v in ipairs(post_data) do
+--                debug("post data222222 " .. " value: " .. v)
+--            end
+        end
+    end
+    end
+
+    if not checkdynamic(listdata, ruledata, waf_engine_status) then
+        local detect_start = gettimeofday()
+        local detect_res = detectcore(listdata, uri_list, args_list, headers_list, post_data)
+        global:set("detect_time", (gettimeofday() - detect_start))
+        if detect_res then
+            checkstatus(waf_engine_status)
+        elseif waf_cc_status ~= "off" then
+            ccdata=ip..host..uri
+            checkcc(listdata, ccdata, waf_cc_status)
+        elseif checkscan(listdata, waf_engine_status) then
+        end
+    end
+
+--    elseif checkrule(listdata, ruledata, waf_engine_status, method, waf_post_status) then
+--    elseif detectcore(listdata, uri_list, args_list, headers_list, post_data) then checkstatus(waf_engine_status)
+--    elseif waf_cc_status ~= "off" then
+--        ccdata=ip..host..uri
+--        checkcc(listdata, ccdata, waf_cc_status)
+--    elseif checkscan(listdata, waf_engine_status) then
+--    end
+end
+
+return checkcore
